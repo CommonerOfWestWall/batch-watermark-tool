@@ -430,6 +430,7 @@ class WatermarkApp:
         self.overwrite_var = tk.BooleanVar(value=False)
         self.copy_audio_var = tk.BooleanVar(value=True)
         self.keep_quality_var = tk.BooleanVar(value=True)
+        self.accel_var = tk.StringVar(value="CPU")
         self.suffix_var = tk.StringVar(value="_watermark")
         self.crf_var = tk.IntVar(value=20)
         self.preset_var = tk.StringVar(value="medium")
@@ -600,6 +601,14 @@ class WatermarkApp:
         ttk.Spinbox(self.pro_output_options, from_=16, to=32, textvariable=self.crf_var, width=6).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
         ttk.Label(self.pro_output_options, text="编码预设").grid(row=2, column=2, sticky="w", pady=(6, 0))
         ttk.Combobox(self.pro_output_options, values=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], textvariable=self.preset_var, state="readonly", width=10).grid(row=2, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Label(self.pro_output_options, text="硬件加速").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Combobox(
+            self.pro_output_options,
+            values=["CPU", "自动选择", "NVIDIA GPU", "AMD GPU", "Intel GPU"],
+            textvariable=self.accel_var,
+            state="readonly",
+            width=12,
+        ).grid(row=3, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(6, 0))
 
     def _build_action_section(self):
         box = ttk.Frame(self.left)
@@ -1119,11 +1128,78 @@ class WatermarkApp:
         cmd += ["-filter_complex", ";".join(filter_parts), "-map", "[outv]"]
 
         if self.copy_audio_var.get():
-            cmd += ["-c:a", "copy"]
-        if self.keep_quality_var.get():
-            cmd += ["-c:v", "libx264", "-crf", str(int(self.crf_var.get())), "-preset", self.preset_var.get(), "-pix_fmt", "yuv420p"]
+            cmd += ["-map", "0:a?", "-c:a", "copy"]
+        else:
+            cmd += ["-an"]
+
+        encoder = self._select_video_encoder()
+        cmd += ["-c:v", encoder]
+        cmd += self._video_quality_args(encoder)
+        cmd += ["-pix_fmt", "yuv420p"]
         cmd += [output_file]
         return cmd
+
+    def _select_video_encoder(self) -> str:
+        accel = self.accel_var.get()
+        encoder_map = {
+            "CPU": "libx264",
+            "NVIDIA GPU": "h264_nvenc",
+            "AMD GPU": "h264_amf",
+            "Intel GPU": "h264_qsv",
+        }
+        if accel in encoder_map:
+            encoder = encoder_map[accel]
+            if encoder in self._get_available_encoders():
+                return encoder
+            self._log(f"未检测到 {encoder}，已回退 CPU 编码 libx264。")
+            return "libx264"
+
+        available = self._get_available_encoders()
+        for encoder in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+            if encoder in available:
+                return encoder
+        return "libx264"
+
+    def _get_available_encoders(self) -> set[str]:
+        if hasattr(self, "_available_encoders_cache"):
+            return self._available_encoders_cache
+        if not shutil.which("ffmpeg"):
+            self._available_encoders_cache = {"libx264"}
+            return self._available_encoders_cache
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=12,
+            )
+            encoders = set(re.findall(r"\s([a-zA-Z0-9_]+)\s+", result.stdout))
+            for name in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+                if name in result.stdout:
+                    encoders.add(name)
+            self._available_encoders_cache = encoders or {"libx264"}
+        except Exception:
+            self._available_encoders_cache = {"libx264"}
+        return self._available_encoders_cache
+
+    def _video_quality_args(self, encoder: str) -> list[str]:
+        crf = str(int(self.crf_var.get()))
+        if encoder == "libx264":
+            if self.keep_quality_var.get():
+                return ["-crf", crf, "-preset", self.preset_var.get()]
+            return ["-preset", "veryfast"]
+        if encoder.endswith("_nvenc"):
+            preset = "p7" if self.keep_quality_var.get() else "p3"
+            return ["-rc", "vbr", "-cq", crf, "-b:v", "0", "-preset", preset]
+        if encoder.endswith("_qsv"):
+            preset = "slower" if self.keep_quality_var.get() else "veryfast"
+            return ["-global_quality", crf, "-preset", preset]
+        if encoder.endswith("_amf"):
+            quality = "quality" if self.keep_quality_var.get() else "speed"
+            return ["-quality", quality, "-qp_i", crf, "-qp_p", crf, "-qp_b", crf]
+        return []
 
     def _make_output_path(self, video: str) -> str:
         out_dir = Path(self.output_dir.get())
