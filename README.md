@@ -8,7 +8,7 @@
 
 基于 **Python + FFmpeg** 的 Windows 桌面工具，支持批量为视频添加**图片水印**或**文字水印**，可在右下角、左上角等预设位置精确放置，半专业模式提供 CRF、编码预设等完整参数调节。
 
-**FFmpeg 优先从 exe 同目录读取**，只需把 `ffmpeg.exe` 和本程序放同一文件夹，无需安装，无需联网。
+修复后的便携版优先查找 EXE 同目录及其 `bin` 子目录中的 FFmpeg，最后才查找 `PATH`。FFmpeg 需单独下载，放好后无需配置环境变量。
 
 ---
 
@@ -36,9 +36,11 @@
 
 ```
 1. 下载并解压 zip
-2. 把 ffmpeg.exe 放入解压后的文件夹（和 .exe 同目录）
+2. 解压 FFmpeg，把其中 bin 文件夹内的 ffmpeg.exe 放到软件 EXE 旁边
 3. 双击运行 批量水印处理工具.exe
 ```
+
+也可以把 FFmpeg 的整个 `bin` 文件夹放到软件 EXE 旁边。`ffprobe.exe` 可选，不影响正常加水印。
 
 > 💡 FFmpeg 下载地址：https://ffmpeg.org/download.html（Windows → builds → ffmpeg-master-latest-win64-gpl.zip）
 
@@ -68,10 +70,11 @@ python 批量加水印_优化版.py
 
 ```bash
 pip install pyinstaller
-pyinstaller 批量水印处理工具.spec
+python -m PyInstaller --onefile --windowed --name "批量水印处理工具" 批量加水印_优化版.py
 ```
 
 打包产物在 `dist/` 目录中。
+自定义图标时，提供 `OIG.ico`，并在上述命令中加上 `--icon OIG.ico --add-data "OIG.ico:."`，分别设置 EXE 文件和应用窗口的图标。
 
 ---
 
@@ -141,7 +144,7 @@ pyinstaller 批量水印处理工具.spec
 
 ### Overview
 
-A lightweight **Python + FFmpeg** Windows desktop tool for batch adding image or text watermarks to videos. Drag the watermark on the preview canvas to set position precisely. FFmpeg is loaded from the same directory as the exe first, so just place them together and run — no installation or internet required.
+A lightweight **Python + FFmpeg** Windows desktop tool for batch adding image or text watermarks to videos. Drag the watermark on the preview canvas to set position precisely. The fixed portable build looks for FFmpeg next to the app or in a neighboring `bin` folder before checking `PATH`. Download FFmpeg separately; no environment setup is needed when it is placed with the app.
 
 ### Features
 
@@ -158,7 +161,7 @@ A lightweight **Python + FFmpeg** Windows desktop tool for batch adding image or
 
 1. Download latest release from **[Releases page](https://github.com/CommonerOfWestWall/batch-watermark-tool/releases)**
 2. Extract the zip
-3. Place `ffmpeg.exe` in the same folder as the tool
+3. Extract FFmpeg and put `ffmpeg.exe` (or the entire `bin` folder) next to the app executable. `ffprobe.exe` is optional.
 4. Double-click the exe and run
 
 > Download FFmpeg: https://ffmpeg.org/download.html → Windows builds
@@ -176,8 +179,10 @@ python 批量加水印_优化版.py
 
 ```bash
 pip install pyinstaller
-pyinstaller 批量水印处理工具.spec
+python -m PyInstaller --onefile --windowed --name "批量水印处理工具" 批量加水印_优化版.py
 ```
+
+To set both the EXE and window icons, provide `OIG.ico` and add `--icon OIG.ico --add-data "OIG.ico:."` to the build command.
 
 ### License
 

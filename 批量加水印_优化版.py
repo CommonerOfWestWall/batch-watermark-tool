@@ -21,6 +21,18 @@ except ImportError:
 
 VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".webm", ".m4v")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+FFMPEG_MISSING = "请把解压后的 ffmpeg.exe 放到程序所在文件夹（或其 bin 子文件夹），也可以将 FFmpeg 加入 PATH。"
+
+
+def find_media_tool(name: str) -> Optional[str]:
+    app_dir = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+    filename = f"{name}.exe" if os.name == "nt" else name
+    for directory in (app_dir, app_dir / "bin"):
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which(name)
+    return os.path.abspath(found) if found else None
 
 
 def resource_font_path() -> str:
@@ -391,6 +403,9 @@ class WatermarkApp:
     def __init__(self, master: tk.Tk):
         self.master = master
         self.master.title("批量水印处理工具 Pro")
+        icon = Path(__file__).with_name("OIG.ico")
+        if os.name == "nt" and icon.is_file():
+            self.master.iconbitmap(default=str(icon))
         self.master.geometry("1240x820")
         self.master.minsize("1080", "720")
 
@@ -399,6 +414,7 @@ class WatermarkApp:
         self.running = False
         self.stop_requested = False
         self.log_queue: queue.Queue = queue.Queue()
+        self._gpu_probe_cache: dict[str, bool] = {}
 
         self.preview_w = 640
         self.preview_h = 360
@@ -421,8 +437,8 @@ class WatermarkApp:
         self._redraw_preview()
         self._poll_log_queue()
 
-        if not shutil.which("ffmpeg"):
-            self._log("⚠ 未检测到 ffmpeg。请先安装 FFmpeg，并把 ffmpeg 加入系统 PATH。")
+        if not find_media_tool("ffmpeg"):
+            self._log(f"⚠ 未找到 FFmpeg。{FFMPEG_MISSING}")
 
     def _build_vars(self):
         self.mode_var = tk.StringVar(value="beginner")
@@ -948,8 +964,8 @@ class WatermarkApp:
         if not self.output_dir.get():
             messagebox.showerror("缺少输出目录", "请选择输出目录。")
             return False
-        if not shutil.which("ffmpeg"):
-            messagebox.showerror("未找到 FFmpeg", "系统没有检测到 ffmpeg。请安装 FFmpeg 并加入 PATH 后再运行。")
+        if not find_media_tool("ffmpeg"):
+            messagebox.showerror("未找到 FFmpeg", FFMPEG_MISSING)
             return False
 
         valid_count = 0
@@ -987,7 +1003,7 @@ class WatermarkApp:
 
     def _get_video_size(self, video: str) -> Optional[Tuple[int, int]]:
         """获取视频分辨率，用于把预览像素换算成实际像素。"""
-        ffprobe = shutil.which("ffprobe")
+        ffprobe = find_media_tool("ffprobe")
         if ffprobe:
             cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
                    "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video]
@@ -1001,8 +1017,11 @@ class WatermarkApp:
             except Exception:
                 pass
         # fallback: 解析 ffmpeg -i 输出
+        ffmpeg = find_media_tool("ffmpeg")
+        if not ffmpeg:
+            return None
         try:
-            result = subprocess.run(["ffmpeg", "-hide_banner", "-i", video],
+            result = subprocess.run([ffmpeg, "-hide_banner", "-i", video],
                                     capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=30)
             output = result.stderr + result.stdout
@@ -1063,7 +1082,10 @@ class WatermarkApp:
         return f"'{min_alpha:.3f}+{amplitude:.3f}*abs(sin(2*PI*{speed}*t/3))'"
 
     def generate_ffmpeg_cmd(self, input_file: str, output_file: str) -> list[str]:
-        cmd = ["ffmpeg", "-hide_banner", "-y" if self.overwrite_var.get() else "-n", "-i", input_file]
+        ffmpeg = find_media_tool("ffmpeg")
+        if not ffmpeg:
+            raise FileNotFoundError(FFMPEG_MISSING)
+        cmd = [ffmpeg, "-hide_banner", "-y" if self.overwrite_var.get() else "-n", "-i", input_file]
 
         # 获取视频实际分辨率，把预览像素换算过去
         video_w, video_h = self._get_video_size(input_file) or (self.preview_w, self.preview_h)
@@ -1141,34 +1163,50 @@ class WatermarkApp:
 
     def _select_video_encoder(self) -> str:
         accel = self.accel_var.get()
+        if accel == "CPU":
+            return "libx264"
         encoder_map = {
-            "CPU": "libx264",
             "NVIDIA GPU": "h264_nvenc",
             "AMD GPU": "h264_amf",
             "Intel GPU": "h264_qsv",
         }
-        if accel in encoder_map:
-            encoder = encoder_map[accel]
-            if encoder in self._get_available_encoders():
+        selected = encoder_map.get(accel)
+        candidates = (selected,) if selected else ("h264_nvenc", "h264_qsv", "h264_amf")
+        for encoder in candidates:
+            if encoder in self._get_available_encoders() and self._can_encode_on_gpu(encoder):
                 return encoder
-            self._log(f"未检测到 {encoder}，已回退 CPU 编码 libx264。")
-            return "libx264"
-
-        available = self._get_available_encoders()
-        for encoder in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
-            if encoder in available:
-                return encoder
+        self._log(f"{selected or 'GPU 编码器'}不可用，已回退 CPU 编码 libx264。")
         return "libx264"
+
+    def _can_encode_on_gpu(self, encoder: str) -> bool:
+        if encoder in self._gpu_probe_cache:
+            return self._gpu_probe_cache[encoder]
+        ffmpeg = find_media_tool("ffmpeg")
+        if not ffmpeg:
+            return False
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=s=640x360:r=25", "-frames:v", "1", "-an",
+                 "-pix_fmt", "yuv420p", "-c:v", encoder, "-f", "null", "-"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            available = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            available = False
+        self._gpu_probe_cache[encoder] = available
+        return available
 
     def _get_available_encoders(self) -> set[str]:
         if hasattr(self, "_available_encoders_cache"):
             return self._available_encoders_cache
-        if not shutil.which("ffmpeg"):
-            self._available_encoders_cache = {"libx264"}
-            return self._available_encoders_cache
+        ffmpeg = find_media_tool("ffmpeg")
+        if not ffmpeg:
+            return {"libx264"}
         try:
             result = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
+                [ffmpeg, "-hide_banner", "-encoders"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1215,6 +1253,7 @@ class WatermarkApp:
         Path(self.output_dir.get()).mkdir(parents=True, exist_ok=True)
         self.running = True
         self.stop_requested = False
+        self._gpu_probe_cache.clear()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress.config(value=0, maximum=len(self.video_files))
@@ -1231,10 +1270,10 @@ class WatermarkApp:
             if self.stop_requested:
                 break
             output_path = self._make_output_path(video)
-            cmd = self.generate_ffmpeg_cmd(video, output_path)
             self._log(f"[{idx}/{len(self.video_files)}] 开始：{os.path.basename(video)}")
-            self._log("命令：" + " ".join(shlex.quote(x) for x in cmd))
             try:
+                cmd = self.generate_ffmpeg_cmd(video, output_path)
+                self._log("命令：" + " ".join(shlex.quote(x) for x in cmd))
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
                 all_lines = []
                 for line in p.stdout or []:
